@@ -3,7 +3,9 @@ local names = require("shared")
 local teleporter_name = names.entities.teleporter
 local teleporter_sticker = names.entities.teleporter_sticker
 
-local script_data =
+--The set of tables the rest of this file expects to find in storage. Also used on a
+--configuration change to fill in anything a save from an older version is missing.
+local default_script_data =
 {
   networks = {},
   rename_frames = {},
@@ -16,6 +18,8 @@ local script_data =
   search_boxes = {},
   recent = {}
 }
+
+local script_data = util.copy(default_script_data)
 
 local preview_size = 256
 
@@ -68,7 +72,11 @@ local make_rename_frame = function(player, caption)
 
   local force = player.force
   local teleporters = script_data.networks[force.name]
-  local param = teleporters[caption]
+  local param = teleporters and teleporters[caption]
+  if not param then
+    --The teleporter was renamed or removed between the GUI being built and the button clicked.
+    return
+  end
   local text = param.flying_text
   local gui = player.gui.screen
   local frame = gui.add{type = "frame", caption = {"rename-teleporter", caption}, direction = "horizontal"}
@@ -116,11 +124,14 @@ local add_recent = function(player, teleporter)
 end
 
 local unlink_teleporter = function(player)
-  if player.character then player.character.active = true end
+  if not (player and player.valid) then return end
+  --2.1 removed the LuaEntity::active write, disabled_by_script is the inverse of it.
+  local character = player.character
+  if character and character.valid then character.disabled_by_script = false end
   close_gui(get_teleporter_frame(player))
   local source = script_data.player_linked_teleporter[player.index]
   if source and source.valid then
-    source.active = true
+    source.disabled_by_script = false
     add_recent(player, source)
   end
   script_data.player_linked_teleporter[player.index] = nil
@@ -138,11 +149,6 @@ local clear_teleporter_data = function(teleporter_data)
   end
 end
 
-
-local get_sort_function = function()
-  return
-  function(t, a, b) return a < b end
-end
 
 local make_teleporter_gui = function(player, source)
 
@@ -165,7 +171,12 @@ local make_teleporter_gui = function(player, source)
 
   local force = source.force
   local network = script_data.networks[force.name]
-  if not network then return end
+  if not network then
+    --Bailing out here without unlinking would leave the player standing frozen on the pad with
+    --no GUI and no way to get out of it.
+    unlink_teleporter(player)
+    return
+  end
 
   local gui = player.gui.screen
   local frame = gui.add{type = "frame", direction = "vertical", ignored_by_interaction = false}
@@ -277,8 +288,8 @@ local make_teleporter_gui = function(player, source)
       local label = inner_flow.add{type = "label", caption = caption}
       label.style.horizontally_stretchable = true
       label.style.font = "default-dialog-button"
-      label.style.font_color = {}
-      label.style.horizontally_stretchable = true
+      --No font_color override here: an empty Color table is not 'the default', it is opaque
+      --black (channels default to 0, alpha to 1), which is unreadable on the dark button.
       label.style.maximal_width = preview_size
       util.register_gui(script_data.button_actions, button, {type = "teleport_button", param = teleporter})
       any = true
@@ -293,15 +304,18 @@ local refresh_teleporter_frames = function()
   local players = game.players
   for player_index, source in pairs (script_data.player_linked_teleporter) do
     local player = players[player_index]
-    local frame = get_teleporter_frame(player)
-    if frame then
-      print("Refreshing frame")
-      make_teleporter_gui(player, source)
+    if player and player.valid then
+      local frame = get_teleporter_frame(player)
+      if frame then
+        print("Refreshing frame")
+        make_teleporter_gui(player, source)
+      end
     end
   end
 end
 
 local check_player_linked_teleporter = function(player)
+  if not (player and player.valid) then return end
   print("Checking player linked teleporter")
   local source = script_data.player_linked_teleporter[player.index]
   if source and source.valid then
@@ -314,10 +328,14 @@ local check_player_linked_teleporter = function(player)
 end
 
 local resync_teleporter = function(name, teleporter_data)
+  if not teleporter_data then return end
   local teleporter = teleporter_data.teleporter
   if not (teleporter and teleporter.valid) then
     return
   end
+  --Keep the name on the data itself. Reading it back off the flying text errors out as soon as
+  --that render object is gone, and it is the only handle we have on the network key.
+  teleporter_data.name = name
   local force = teleporter.force
   local surface = teleporter.surface
   local color = get_force_color(force)
@@ -355,7 +373,7 @@ end
 
 local is_name_available = function(force, name)
   local network = script_data.networks[force.name]
-  return not network[name]
+  return not (network and network[name])
 end
 
 local rename_teleporter = function(force, old_name, new_name)
@@ -364,7 +382,12 @@ local rename_teleporter = function(force, old_name, new_name)
     return
   end
   local network = script_data.networks[force.name]
-  local teleporter_data = network[old_name]
+  local teleporter_data = network and network[old_name]
+  if not teleporter_data then
+    --Nothing registered under that name, so there is nothing to rename.
+    refresh_teleporter_frames()
+    return
+  end
   network[new_name] = teleporter_data
   network[old_name] = nil
   resync_teleporter(new_name, teleporter_data)
@@ -467,11 +490,19 @@ local on_built_entity = function(event)
   local entity = event.created_entity or event.entity or event.destination
   if not (entity and entity.valid) then return end
   if entity.name ~= teleporter_name then return end
-  local surface = entity.surface
   local force = entity.force
-  local name = "Teleporter ".. entity.unit_number
   local network = get_network(force)
-  local teleporter_data = {teleporter = entity, flying_text = text, tag = tag}
+  --A player can rename a teleporter to anything, including the default name of one not built
+  --yet. Claiming a taken key here would silently drop the other teleporter out of the network.
+  local name = "Teleporter ".. entity.unit_number
+  if network[name] then
+    local suffix = 2
+    while network[name .. " (" .. suffix .. ")"] do
+      suffix = suffix + 1
+    end
+    name = name .. " (" .. suffix .. ")"
+  end
+  local teleporter_data = {teleporter = entity}
   network[name] = teleporter_data
   script_data.teleporter_map[entity.unit_number] = teleporter_data
   resync_teleporter(name, teleporter_data)
@@ -484,9 +515,14 @@ local on_teleporter_removed = function(entity)
   local force = entity.force
   local teleporter_data = script_data.teleporter_map[entity.unit_number]
   if not teleporter_data then return end
-  local caption = teleporter_data.flying_text.text
+  local caption = teleporter_data.name
+  if not caption then
+    --Data from before the name was stored on the teleporter data itself.
+    local flying_text = teleporter_data.flying_text
+    caption = flying_text and flying_text.valid and flying_text.text
+  end
   local network = get_network(force)
-  network[caption] = nil
+  if caption then network[caption] = nil end
   clear_teleporter_data(teleporter_data)
   script_data.teleporter_map[entity.unit_number] = nil
 
@@ -496,18 +532,15 @@ local on_teleporter_removed = function(entity)
 end
 
 local teleporter_triggered = function(entity, character)
-  if not (entity and entity.valid and entity.name == teleporter_name) then return error("HEOK") end
+  if not (entity and entity.valid and entity.name == teleporter_name) then return end
   if character.type ~= "character" then return end
-  local force = entity.force
-  local surface = entity.surface
-  local position = entity.position
-  local param = script_data.teleporter_map[entity.unit_number]
   local player = character.player
-  if not player then return end
+  if not (player and player.valid) then return end
   player.teleport(entity.position)
-  entity.active = false
+  --2.1 removed the LuaEntity::active write, disabled_by_script is the inverse of it.
+  entity.disabled_by_script = true
   entity.timeout = entity.prototype.timeout
-  character.active = false
+  character.disabled_by_script = true
   script_data.player_linked_teleporter[player.index] = entity
   make_teleporter_gui(player, entity)
 end
@@ -516,19 +549,6 @@ local on_entity_removed = function(event)
   local entity = event.entity
   if not (entity and entity.valid) then return end
   on_teleporter_removed(entity)
-end
-
-
-local on_entity_died = function(event)
-  on_teleporter_removed(event.entity)
-end
-
-local on_player_mined_entity = function(event)
-  on_teleporter_removed(event.entity)
-end
-
-local on_robot_mined_entity = function(event)
-  on_teleporter_removed(event.entity)
 end
 
 local on_gui_action = function(event)
@@ -576,14 +596,42 @@ local on_player_removed = function(event)
 end
 
 local resync_all_teleporters = function()
+  --Rebuilt from the networks below, so any entry left over from a teleporter that went away
+  --without its removal event firing gets dropped rather than lingering forever.
+  script_data.tag_map = {}
+  script_data.teleporter_map = {}
   for force, network in pairs (script_data.networks) do
     for name, teleporter_data in pairs (network) do
-      resync_teleporter(name, teleporter_data)
+      local teleporter = teleporter_data.teleporter
+      if teleporter and teleporter.valid then
+        resync_teleporter(name, teleporter_data)
+        script_data.teleporter_map[teleporter.unit_number] = teleporter_data
+      else
+        --Teleporter is gone, so drop the leftover text/tag and the network entry with it.
+        clear_teleporter_data(teleporter_data)
+        network[name] = nil
+      end
     end
   end
 end
 
+--Reading a SignalID whose type is "item" gives back a nil type, so an icon set to the teleporter
+--item comes back as {name = "teleporter"} with no type at all.
+local is_teleporter_icon = function(icon)
+  return icon ~= nil and icon.name == teleporter_name and (icon.type or "item") == "item"
+end
+
+--Writing to a tag raises on_chart_tag_modified again, straight back into us. Reverting a
+--rejected rename puts the teleporter's own name back, which is 'taken' by the teleporter
+--itself, so without this guard the revert gets rejected and reverted forever.
+local revert_tag = function(tag, field, value)
+  script_data.modifying_tag = true
+  tag[field] = value
+  script_data.modifying_tag = false
+end
+
 local on_chart_tag_modified = function(event)
+  if script_data.modifying_tag then return end
   local force = event.force
   local tag = event.tag
   if not (force and force.valid and tag and tag.valid) then return end
@@ -596,10 +644,10 @@ local on_chart_tag_modified = function(event)
 
   local old_name = event.old_text
   local new_name = tag.text
-  if tag.icon and tag.icon.name ~= teleporter_name then
-    --They're trying to modify the icon! Straight to JAIL!
+  if not is_teleporter_icon(tag.icon) then
+    --They're trying to modify the icon, or clear it! Straight to JAIL!
     if player and player.valid then player.print({"cant-change-icon"}) end
-    tag.icon = {type = "item", name = teleporter_name}
+    revert_tag(tag, "icon", {type = "item", name = teleporter_name})
   end
   if new_name == old_name then
     return
@@ -608,7 +656,8 @@ local on_chart_tag_modified = function(event)
     if player and player.valid then
       player.print({"name-already-taken"})
     end
-    tag.text = old_name
+    --Revert to the name we actually have it filed under, which is what the rest of the mod goes by.
+    revert_tag(tag, "text", teleporter_data.name or old_name)
     return
   end
   rename_teleporter(force, old_name, new_name)
@@ -623,8 +672,9 @@ local on_chart_tag_removed = function(event)
     --Nothing to do with us...
     return
   end
-  local name = tag.text
-  resync_teleporter(name, teleporter_data)
+  --Go by the name we have it filed under. The tag being removed may have had its text edited
+  --to something we rejected, and the network key is what the GUI and lookups actually use.
+  resync_teleporter(teleporter_data.name or tag.text, teleporter_data)
 end
 
 local on_chart_tag_added = function(event)
@@ -633,8 +683,7 @@ local on_chart_tag_added = function(event)
   if not (tag and tag.valid) then
     return
   end
-  local icon = tag.icon
-  if icon and icon.type == "item" and icon.name == teleporter_name then
+  if is_teleporter_icon(tag.icon) then
     --Trying to add a fake teleporter tag! JAIL!
     local player = event.player_index and game.get_player(event.player_index)
     if player and player.valid then player.print({"cant-add-tag"}) end
@@ -773,6 +822,13 @@ teleporters.on_load = function()
 end
 
 teleporters.on_configuration_changed = function()
+  --A save made by an older version can be missing tables that were added since, and every
+  --lookup below assumes they are there.
+  for key, value in pairs (default_script_data) do
+    if type(value) == "table" and not script_data[key] then
+      script_data[key] = {}
+    end
+  end
   resync_all_teleporters()
 end
 

@@ -87,7 +87,6 @@ teleporter_item.localised_name = localised_name
 teleporter_item.place_result = name
 teleporter_item.icon = path.."teleporter-icon.png"
 teleporter_item.icon_size = 64
-teleporter_item.icon_mipmaps = 0
 teleporter_item.subgroup = "circuit-network"
 
 
@@ -156,7 +155,9 @@ local hotkey =
   type = "custom-input",
   name = hotkey_name,
   linked_game_control = "focus-search",
-  key_sequence = "Control + F"
+  --Linked custom inputs fire from the game control's own binding, so the sequence is left unset.
+  --2.1 dropped the old lenient modifier names, and "Control + F" is no longer parsed.
+  key_sequence = ""
 }
 
 data:extend
