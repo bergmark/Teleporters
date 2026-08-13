@@ -3,5 +3,11 @@
     "spell-check",
     "codestyle-check",
     "undefined-global"
+  ],
+  "factorio.versions": [
+    {
+      "name": "Factorio fetched",
+      "factorioPath": "c:\\Factorio\\bin\\fetched\\factorio.exe"
+    }
   ]
 }
