@@ -364,7 +364,8 @@ local rename_teleporter = function(force, old_name, new_name)
     return
   end
   local network = script_data.networks[force.name]
-  local teleporter_data = network[old_name]
+  local teleporter_data = network and network[old_name]
+  if not teleporter_data then return end
   network[new_name] = teleporter_data
   network[old_name] = nil
   resync_teleporter(new_name, teleporter_data)
@@ -588,10 +589,13 @@ local on_chart_tag_modified = function(event)
   local tag = event.tag
   if not (force and force.valid and tag and tag.valid) then return end
   local teleporter_data = script_data.tag_map[tag.tag_number]
-  if not teleporter_data then
-    --Nothing to do with us...
-    return
-  end
+  -- Tag numbers are only unique within a force. Another mod's tag can have the
+  -- same number, so do not touch it unless it is the tag we registered.
+  if not teleporter_data or not (teleporter_data.tag and teleporter_data.tag.valid)
+    or teleporter_data.tag ~= tag then return end
+
+  local network = script_data.networks[force.name]
+  if not network or network[event.old_text] ~= teleporter_data then return end
   local player = event.player_index and game.get_player(event.player_index)
 
   local old_name = event.old_text
@@ -619,10 +623,7 @@ local on_chart_tag_removed = function(event)
   local tag = event.tag
   if not (force and force.valid and tag and tag.valid) then return end
   local teleporter_data = script_data.tag_map[tag.tag_number]
-  if not teleporter_data then
-    --Nothing to do with us...
-    return
-  end
+  if not teleporter_data or teleporter_data.tag ~= tag then return end
   local name = tag.text
   resync_teleporter(name, teleporter_data)
 end
